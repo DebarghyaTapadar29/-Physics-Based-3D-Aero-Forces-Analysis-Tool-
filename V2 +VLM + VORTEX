@@ -1,0 +1,429 @@
+
+
+clear; clc; close all;
+
+%% =================== 1. SIMULATION CONFIGURATION ===================
+stl_file =['Z1.stl']; % <-- CHANGE THIS to your STL file name
+stl_unit_conversion_factor = 1000; 
+
+% --- PHYSICS SETTINGS ---
+influence_factor = 0.15; 
+influence_iterations = 2;
+
+%% =================== 1b. FLIGHT ENVELOPE SETUP ===================
+fprintf('--- Configuring Flight Envelope ---\n');
+ft_to_m = 0.3048; mach_alt_pairs = []; 
+
+list = {'Subsonic', 'Transonic', 'Supersonic'};
+[indx, tf] = listdlg('PromptString', {'Select flight regimes:', '(Ctrl+Click for multiple)'}, ...
+                     'SelectionMode', 'multiple', 'ListString', list, 'InitialValue', [1, 3]);
+if ~tf, error('Simulation cancelled.'); end
+selected_regimes = list(indx);
+
+prompt_aoa = {'AoA Range deg (min:step:max):'};
+definput_aoa = {'0:2:10'}; 
+answer_aoa = inputdlg(prompt_aoa, 'AoA Config', [1 50], definput_aoa);
+if isempty(answer_aoa), error('Cancelled.'); end
+aoa_range_deg = str2num(answer_aoa{1}); 
+
+if any(strcmp(selected_regimes, 'Subsonic'))
+    prompt = {'Mach Range (min:step:max):', 'Altitude Range ft (min:step:max):'};
+    definput = {'0.3:0.2:0.8', '0:2500:30000'};
+    answer = inputdlg(prompt, 'Subsonic Config', [1 50], definput);
+    if ~isempty(answer)
+        [M_sub, A_sub] = meshgrid(str2num(answer{1}), str2num(answer{2}) * ft_to_m);
+        mach_alt_pairs = [mach_alt_pairs; M_sub(:), A_sub(:)];
+    end
+end
+if any(strcmp(selected_regimes, 'Transonic'))
+    prompt = {'Mach Range (min:step:max):', 'Altitude Range ft (min:step:max):'};
+    definput = {'0.85:0.05:1.2', '25000:5000:50000'};
+    answer = inputdlg(prompt, 'Transonic Config', [1 50], definput);
+    if ~isempty(answer)
+        [M_tran, A_tran] = meshgrid(str2num(answer{1}), str2num(answer{2}) * ft_to_m);
+        mach_alt_pairs = [mach_alt_pairs; M_tran(:), A_tran(:)];
+    end
+end
+if any(strcmp(selected_regimes, 'Supersonic'))
+    prompt = {'Mach Range (min:step:max):', 'Altitude Range ft (min:step:max):'};
+    definput = {'1.3:0.2:3.0', '50000:10000:90000'};
+    answer = inputdlg(prompt, 'Supersonic Config', [1 50], definput);
+    if ~isempty(answer)
+        [M_sup, A_sup] = meshgrid(str2num(answer{1}), str2num(answer{2}) * ft_to_m);
+        mach_alt_pairs = [mach_alt_pairs; M_sup(:), A_sup(:)];
+    end
+end
+if isempty(mach_alt_pairs), error('No flight conditions defined.'); end
+mach_alt_pairs = unique(mach_alt_pairs, 'rows');
+
+%% =================== 2. GEOMETRY PROCESSING ===================
+fprintf('\n--- Processing Geometry ---\n');
+try, model = stlread(stl_file); catch, error('Failed to read STL file.'); end
+model = triangulation(model.ConnectivityList, model.Points / stl_unit_conversion_factor);
+[panels] = preprocess_geometry(model);
+S_ref_m2 = estimate_projected_area(model); 
+fprintf('Geometry: %d panels | Projected Area: %.2f m^2\n', length(panels.areas), S_ref_m2);
+
+num_mach_alt_pairs = size(mach_alt_pairs, 1);
+num_cases = num_mach_alt_pairs * length(aoa_range_deg);
+
+%% =================== 3. MAIN SIMULATION LOOP ===================
+fprintf('Running %d physics cases (VLM Enabled)...\n', num_cases);
+results = cell(num_cases, 1);
+case_index = 1;
+tic;
+
+for pair_idx = 1:num_mach_alt_pairs
+    M = mach_alt_pairs(pair_idx, 1); alt_m = mach_alt_pairs(pair_idx, 2);
+    [T_inf, P_inf, rho_inf, mu_inf] = get_standard_atmosphere(alt_m);
+    a = sqrt(1.4 * 287 * T_inf); U_inf = M * a; q_inf = 0.5 * rho_inf * U_inf^2;
+    L_char = sqrt(S_ref_m2); Re = rho_inf * U_inf * L_char / mu_inf;
+    
+    for aoa_deg = aoa_range_deg
+        fprintf('  Calc: M=%.2f, AoA=%.1f... \n', M, aoa_deg);
+        [Cp, VLM_Lift, VLM_Drag_i] = solver_hybrid_vlm(panels, M, aoa_deg, q_inf, S_ref_m2);
+        % NOTE: The VLM_Lift and VLM_Drag_i outputs are ignored by the new v11-based force calculator.
+        [L_N, D_N] = calculate_forces_hybrid(panels, Cp, q_inf, aoa_deg, Re, M, VLM_Lift, VLM_Drag_i);
+        ld_ratio = NaN; if D_N > 1e-9, ld_ratio = L_N / D_N; end
+        results{case_index} = {alt_m, M, aoa_deg, L_N/1000, D_N/1000, ld_ratio};
+        case_index = case_index + 1;
+    end
+end
+fprintf('Simulation complete in %.2f seconds.\n', toc);
+
+%% =================== 4. DATA PROCESSING ===================
+results_table = cell2table(vertcat(results{:}), 'VariableNames', {'Altitude_m', 'Mach', 'AOA_deg', 'Lift_kN', 'Drag_kN', 'LD_Ratio'});
+fig = figure('Name', 'Data', 'Position', [50 50 800 500]);
+uitable(fig, 'Data', table2cell(results_table), 'ColumnName', results_table.Properties.VariableNames, 'Units', 'Normalized', 'Position', [0,0,1,1]);
+
+%% =================== 5. STANDARD VISUALIZATION ===================
+fprintf('\n--- Generating Standard Visualizations ---\n');
+visualize_performance_robust(results_table, S_ref_m2);
+visualize_heatmaps_by_altitude_enhanced(results_table);
+visualize_massive_heatmap(results_table);
+visualize_3d_performance_map(results_table);
+visualize_optimal_pressure_plots(results_table, model, panels, q_inf, S_ref_m2);
+if any(strcmp(selected_regimes, 'Supersonic'))
+    visualize_supersonic_pressure_milestones(results_table, model, panels, q_inf, S_ref_m2);
+end
+
+%% =================== 6. ADVANCED VORTEX VISUALIZATION (BODY-ONLY) ===================
+fprintf('\n--- Advanced Vortex Visualization (High Definition) ---\n');
+valid_cases = results_table(results_table.Lift_kN > 0 & results_table.Drag_kN > 0, :);
+[~, sortIdx] = sort(valid_cases.LD_Ratio, 'descend');
+top_n = min(5, height(valid_cases));
+top_indices = sortIdx(1:top_n);
+top_cases = valid_cases(top_indices, :);
+fprintf('TOP 5 OPTIMAL L/D CONDITIONS:\n'); disp(top_cases);
+selection_strings = cell(top_n, 1);
+for i = 1:top_n
+    selection_strings{i} = sprintf('Rank %d: L/D=%.2f | M=%.2f | AoA=%.1f | Alt=%.0fm', i, top_cases.LD_Ratio(i), top_cases.Mach(i), top_cases.AOA_deg(i), top_cases.Altitude_m(i));
+end
+[s_idx, s_tf] = listdlg('PromptString', 'Select ONE Optimal Case for Vortex Analysis:', 'SelectionMode', 'single', 'ListString', selection_strings, 'ListSize', [400, 150]);
+if s_tf
+    selected_case = top_cases(s_idx, :);
+    fprintf('\nSelected for CFD: M=%.2f, AoA=%.1f\n', selected_case.Mach, selected_case.AOA_deg);
+    prompt = {'How many cross-section slices?'};
+    slice_ans = inputdlg(prompt, 'Slice Config', [1 50], {'10'});
+    if isempty(slice_ans), num_slices = 10; else, num_slices = str2double(slice_ans{1}); end
+    fprintf('Initializing High-Res Physics Engine...\n');
+    Cp_opt = solver_hybrid_vlm(panels, selected_case.Mach, selected_case.AOA_deg, q_inf, S_ref_m2);
+    [Xg, Yg, Zg, U, V, W, VortMag] = generate_body_only_physics_HD(model, panels, Cp_opt, selected_case.Mach, selected_case.AOA_deg, U_inf, num_slices);
+    fprintf('  -> Generating Body-Cutting Slices...\n');
+    visualize_slices_with_body(model, Xg, Yg, Zg, VortMag, selected_case, num_slices);
+    fprintf('  -> Auto-Launching HD Sweep Animation with Contours...\n');
+    animate_body_sweep_HD(model, Cp_opt, Xg, Yg, Zg, VortMag, selected_case);
+end
+
+%% =================== 7. EXPORT ===================
+[file, path] = uiputfile('*.xlsx', 'Save Results', 'AeroResults_v35.xlsx');
+if ~isequal(file, 0), writetable(results_table, fullfile(path, file)); end
+
+%% =================== PHYSICS KERNEL ===================
+
+function area = estimate_projected_area(model)
+    pts = model.Points;
+    try, k=convhull(pts(:,1), pts(:,2)); area=polyarea(pts(k,1), pts(k,2));
+    catch, area = (max(pts(:,1))-min(pts(:,1))) * (max(pts(:,2))-min(pts(:,2))) * 0.7; end
+end
+function [panels] = preprocess_geometry(model)
+    v = model.Points; f = model.ConnectivityList;
+    panels.centroids = (v(f(:,1),:) + v(f(:,2),:) + v(f(:,3),:)) / 3;
+    p1=v(f(:,1),:); p2=v(f(:,2),:); p3=v(f(:,3),:);
+    cr = cross(p2-p1, p3-p1, 2);
+    panels.areas = 0.5 * sqrt(sum(cr.^2, 2));
+    panels.normals = cr ./ (2*panels.areas);
+end
+function [T,P,rho,mu] = get_standard_atmosphere(h)
+    if h > 20000, T=216.65; P=22632*exp(-1.57e-4*(h-11000));
+    else, T=288.15 - 0.0065*h; P=101325*(1-2.25577e-5*h)^5.25588; end
+    rho = P/(287.05*T); mu = 1.458e-6*(T^1.5)/(T+110.4);
+end
+
+function [Cp, L_vlm, Di_vlm] = solver_hybrid_vlm(panels, M, aoa_deg, q, S_ref)
+    Cp = zeros(length(panels.areas), 1); L_vlm = 0; Di_vlm = 0;
+    if M < 0.9
+        is_lifting_surface = abs(panels.normals(:,3)) > 0.5 & abs(panels.normals(:,2)) < 0.8;
+        if ~any(is_lifting_surface)
+            Cp = solver_combined_physics(panels, M, aoa_deg); return;
+        end
+        pts = panels.centroids(is_lifting_surface,:);
+        span = max(pts(:,2)) - min(pts(:,2));
+        area = sum(panels.areas(is_lifting_surface));
+        AR = span^2 / area;
+        beta = sqrt(1-M^2);
+        CL_alpha = (2 * pi * AR) / (2 + sqrt(4 + (AR*beta)^2));
+        CL = CL_alpha * deg2rad(aoa_deg);
+        L_vlm = CL * q * S_ref;
+        e = 0.8; 
+        CDi = CL^2 / (pi * AR * e);
+        Di_vlm = CDi * q * S_ref;
+        top_lifting_mask = is_lifting_surface & (panels.normals(:,3) > 0);
+        bottom_lifting_mask = is_lifting_surface & (panels.normals(:,3) < 0);
+        Cp(top_lifting_mask) = -CL;
+        Cp(bottom_lifting_mask) = 0.4*CL;
+    else
+        Cp = solver_combined_physics(panels, M, aoa_deg);
+    end
+end
+
+% --- UPDATED FORCE CALCULATION FUNCTION (BASED ON V11 METHODOLOGY) ---
+function [L_N, D_N] = calculate_forces_hybrid(panels, Cp, q_inf, aoa_deg, Re, M, VLM_Lift, VLM_Drag_i)
+    % This function provides a more complete drag buildup based on the v11 methodology.
+    % It calculates pressure_drag by integrating forces over the entire body and 
+    % separately calculates friction_drag. VLM-specific lift/drag are ignored.
+
+    % 1. SKIN FRICTION DRAG
+    % Using turbulent flat plate correlation with a compressibility correction.
+    if Re > 1e6 
+        Cf = 0.455 / (log10(Re)^2.58); % Schlichting's formula for turbulent flow
+    else
+        Cf = 1.328 / sqrt(Re); % Blasius solution for laminar flow
+    end
+    
+    % Apply compressibility correction (using a standard formula)
+    Cf = Cf / (1 + 0.144 * M^2)^0.65;
+    
+    % Calculate total friction drag force over the entire wetted area
+    wetted_area = sum(panels.areas);
+    friction_drag = Cf * q_inf * wetted_area;
+
+    % 2. PRESSURE FORCES
+    % Pressure acts normal to each panel surface. Integrate over the entire body.
+    force_magnitudes = Cp .* panels.areas * q_inf;
+    force_vectors = -force_magnitudes .* panels.normals;
+    F_total_pressure = sum(force_vectors, 1);
+    
+    % Decompose total pressure force into body axes (Fx, Fz)
+    Fx_body = F_total_pressure(1);
+    Fz_body = F_total_pressure(3);
+    
+    % 3. ROTATE FORCES TO WIND AXES
+    % Rotate body-axis forces to wind axes to get Lift and Drag components
+    aoa_rad = deg2rad(aoa_deg);
+    pressure_lift = Fz_body * cos(aoa_rad) - Fx_body * sin(aoa_rad);
+    pressure_drag = Fz_body * sin(aoa_rad) + Fx_body * cos(aoa_rad);
+    
+    % 4. TOTAL FORCES
+    L_N = pressure_lift;
+    D_N = pressure_drag + friction_drag;
+    
+    % Sanity check: Drag should not be negative
+    if D_N < 0, D_N = 1e-5; end
+end
+
+function Cp = solver_combined_physics(panels, M, aoa_deg)
+    normals = panels.normals; aoa_rad = deg2rad(aoa_deg); V_dir = [cos(aoa_rad); 0; sin(aoa_rad)];
+    dot_prod = normals * V_dir; delta = -asin(dot_prod); Cp = zeros(size(delta));
+    if M < 0.8
+        beta = sqrt(1-M^2);
+        for i = 1:length(delta)
+            d = delta(i);
+            if d >= 0, Cp(i) = (2 * sin(d) + 0.5 * sin(d)^2) / beta; 
+            else
+                if d > deg2rad(-15), Cp(i) = (2 * d) / beta; 
+                else, Cp(i) = -0.2 / beta; end
+            end
+        end
+    elseif M >= 1.2
+        beta = sqrt(M^2-1); Cp_vac = -2/(1.4*M^2); 
+        Cp(delta>=0) = 2*delta(delta>=0)/beta;
+        Cp(delta<0) = max(2*delta(delta<0)/beta, Cp_vac);
+    else
+        Cp(delta>=0) = 2*sin(delta(delta>=0)).^2/0.6; Cp(delta<0)=-0.2;
+    end
+end
+
+% --- MODIFIED PHYSICS GENERATOR (BODY-ONLY) ---
+function [X,Y,Z,U,V,W,VortMag] = generate_body_only_physics_HD(model, panels, Cp, ~, aoa, U_inf, num_slices)
+    pts = model.Points; 
+    min_x = min(pts(:,1)); max_x = max(pts(:,1)); 
+    min_y = min(pts(:,2)); max_y = max(pts(:,2));
+    min_z = min(pts(:,3)); max_z = max(pts(:,3));
+    
+    pad_y = (max_y - min_y) * 0.15;
+    pad_z = (max_z - min_z) * 0.2;
+    
+    % DOMAIN MODIFICATION: Start at nose, END AT TAIL.
+    x = linspace(min_x, max_x, num_slices*10); 
+    y = linspace(min_y-pad_y, max_y+pad_y, 80);
+    z = linspace(min_z-pad_z, max_z+pad_z, 60);
+    
+    [X,Y,Z] = meshgrid(x,y,z);
+    
+    alpha = deg2rad(aoa); U = ones(size(X))*U_inf*cos(alpha); V=zeros(size(X)); W=ones(size(X))*U_inf*sin(alpha);
+    skip = max(1, floor(length(panels.areas)/800)); 
+    p_c = panels.centroids(1:skip:end,:); p_cp = Cp(1:skip:end); p_a = panels.areas(1:skip:end);
+    strength = p_cp .* p_a * 0.5 * U_inf;
+    num_pts = numel(X); batch=10000;
+    
+    for k = 1:batch:num_pts
+        end_idx = min(k+batch-1, num_pts);
+        px = X(k:end_idx); py = Y(k:end_idx); pz = Z(k:end_idx);
+        u_ind=zeros(size(px)); v_ind=zeros(size(px)); w_ind=zeros(size(px));
+        for i = 1:length(strength)
+            rx = px - p_c(i,1); ry = py - p_c(i,2); rz = pz - p_c(i,3);
+            r2 = rx.^2 + ry.^2 + rz.^2 + 1e-4; r3 = r2.^(1.5);
+            fact = strength(i)./r3;
+            u_ind=u_ind+fact.*rx; v_ind=v_ind+fact.*ry; w_ind=w_ind+fact.*rz;
+        end
+        U(k:end_idx)=U(k:end_idx)+u_ind*0.1; V(k:end_idx)=V(k:end_idx)+v_ind*0.1; W(k:end_idx)=W(k:end_idx)+w_ind*0.1;
+    end
+    [cx,cy,cz,~]=curl(X,Y,Z,U,V,W); VortMag=cx; 
+end
+
+%% =================== VISUALIZATION FUNCTIONS (COLOR REFINED) ===================
+
+function visualize_slices_with_body(model, X, Y, Z, VortMag, case_data, num_slices)
+    pts = model.Points; min_x = min(pts(:,1)); max_x = max(pts(:,1));
+    locs = linspace(min_x, max(X(:)), num_slices); x_vec = X(1,:,1);
+    valid_vort = abs(VortMag(~isinf(VortMag)));
+    limit = prctile(valid_vort(:), 98); if limit < 0.1, limit = 1; end
+    for i = 1:num_slices
+        [~, idx] = min(abs(x_vec - locs(i)));
+        try, Y_sl = squeeze(Y(:, idx, :)); Z_sl = squeeze(Z(:, idx, :)); V_sl = squeeze(VortMag(:, idx, :));
+        catch, Y_sl = squeeze(Y(idx, :, :)); Z_sl = squeeze(Z(idx, :, :)); V_sl = squeeze(VortMag(idx, :, :)); end
+        figure('Name', sprintf('Slice %d (X=%.2fm)', i, locs(i)), 'Position', [50+i*30, 50+i*30, 600, 500], 'Color', 'w');
+        contourf(Y_sl, Z_sl, V_sl, 120, 'LineColor', 'none'); 
+        hold on; axis equal; grid off; colormap(jet(256)); clim([-limit, limit]); 
+        tol = (max_x - min_x) * 0.05;
+        slice_pts = pts(abs(pts(:,1) - locs(i)) < tol, 2:3);
+        if size(slice_pts, 1) > 3
+            try, k = convhull(slice_pts(:,1), slice_pts(:,2)); plot(slice_pts(k,1), slice_pts(k,2), 'k-', 'LineWidth', 2); end
+        end
+        colorbar; xlabel('Spanwise (Y)'); ylabel('Vertical (Z)');
+        title(sprintf('HD Vorticity | Slice %d | X=%.1fm', i, locs(i)));
+    end
+end
+function animate_body_sweep_HD(model, Cp, X, Y, Z, VortMag, case_data)
+    while true
+        fig = figure('Name', 'HD Body Sweep Animation', 'Color', 'k', 'Position', [150 150 1000 700]);
+        axis equal; grid on; hold on; view(30, 25);
+        set(gca, 'Color', 'k', 'XColor','w','YColor','w','ZColor','w');
+        xlabel('X'); ylabel('Y'); zlabel('Z');
+        patch('Faces', model.ConnectivityList, 'Vertices', model.Points, 'FaceVertexCData', Cp, 'FaceColor', 'flat', 'EdgeColor', 'none', 'FaceAlpha', 0.6);
+        colormap(fig, jet(256)); 
+        x_vec = X(1,:,1);
+        [hSurf] = surf(squeeze(Y(:,1,:)), squeeze(Z(:,1,:)), squeeze(VortMag(:,1,:)), 'FaceColor', 'interp', 'EdgeColor', 'none', 'FaceAlpha', 0.8);
+        valid_vort = abs(VortMag(~isinf(VortMag))); limit = prctile(valid_vort(:), 98); clim([-limit, limit]); 
+        title('HD Vortex Sweep (Analyzing Structure...)', 'Color', 'w');
+        for k = 1:length(x_vec)
+            if ~isvalid(hSurf), break; end
+            y_curr = squeeze(Y(:,k,:)); z_curr = squeeze(Z(:,k,:)); v_curr = squeeze(VortMag(:,k,:));
+            set(hSurf, 'XData', ones(size(y_curr))*x_vec(k), 'YData', y_curr, 'ZData', z_curr, 'CData', v_curr);
+            drawnow; pause(0.05); 
+        end
+        choice = questdlg('Replay Animation?', 'Replay', 'Yes', 'No', 'Yes');
+        close(fig); if strcmp(choice, 'No'), break; end
+    end
+end
+function visualize_performance_robust(results_table, S_ref)
+    unique_aoas = unique(results_table.AOA_deg); unique_machs = unique(results_table.Mach);
+    figure('Name', 'L/D vs Mach', 'Position', [50 50 600 400]); hold on; grid on;
+    colors = winter(length(unique_aoas));
+    for i = 1:length(unique_aoas)
+        aoa = unique_aoas(i); mask = results_table.AOA_deg == aoa;
+        sub_mach = results_table.Mach(mask); sub_ld = results_table.LD_Ratio(mask);
+        [sub_mach, idx] = sort(sub_mach); plot(sub_mach, sub_ld(idx), '-s', 'Color', colors(i,:), 'LineWidth', 1.5, 'DisplayName', sprintf('AoA %.1f', aoa));
+    end
+    xlabel('Mach'); ylabel('L/D Ratio'); legend('Location','best'); title('L/D Efficiency');
+    figure('Name', 'CL vs AoA', 'Position', [700 50 600 400]); hold on; grid on;
+    colors_m = jet(length(unique_machs));
+    for i = 1:length(unique_machs)
+        M = unique_machs(i); mask = abs(results_table.Mach - M) < 1e-4;
+        sub_aoa = results_table.AOA_deg(mask); sub_lift = results_table.Lift_kN(mask);
+        [sub_aoa, idx] = sort(sub_aoa); q = 0.5 * 1.225 * (M*340)^2; 
+        cl_vals = (sub_lift(idx) * 1000) ./ (q * S_ref);
+        plot(sub_aoa, cl_vals, '-o', 'Color', colors_m(i,:), 'LineWidth', 1.5, 'DisplayName', sprintf('M %.2f', M));
+    end
+    xlabel('AoA'); ylabel('CL'); legend('Location','best'); title('Lift Coeff');
+end
+function visualize_heatmaps_by_altitude_enhanced(results_table)
+    u_alt = unique(results_table.Altitude_m);
+    for i=1:length(u_alt)
+        alt = u_alt(i); sub = results_table(results_table.Altitude_m == alt, :);
+        if height(sub)<4, continue; end
+        fig = figure('Name', sprintf('L/D Heatmap %.0fm', alt));
+        try 
+            h = heatmap(unique(sub.AOA_deg), unique(sub.Mach), reshape(sub.LD_Ratio, length(unique(sub.Mach)), length(unique(sub.AOA_deg))));
+            h.Colormap = jet(256);
+            title(sprintf('L/D Ratio @ %.0f m', alt)); xlabel('AoA'); ylabel('Mach');
+        catch, continue; end
+    end
+end
+function visualize_massive_heatmap(results_table)
+    if height(results_table) < 2, return; end
+    x_labels = unique(results_table.AOA_deg);
+    u_alt = unique(results_table.Altitude_m,'stable'); u_mach = unique(results_table.Mach,'stable');
+    y_labels = cell(length(u_alt)*length(u_mach),1); row=1;
+    for a=u_alt', for m=u_mach', y_labels{row}=sprintf('%.0f m, M %.2f',a,m); row=row+1; end; end
+    Z=nan(length(y_labels), length(x_labels));
+    for i=1:height(results_table)
+        r=results_table(i,:); iy=find(strcmp(y_labels,sprintf('%.0f m, M %.2f',r.Altitude_m,r.Mach))); ix=find(x_labels==r.AOA_deg);
+        if ~isempty(iy)&&~isempty(ix), Z(iy,ix)=r.LD_Ratio; end
+    end
+    fig = figure('Name','Massive L/D Heatmap','Position',[50 50 1000 800]);
+    h = heatmap(x_labels, y_labels, Z);
+    h.Colormap = jet(256);
+    title('Global L/D Heatmap');
+end
+function visualize_3d_performance_map(results_table)
+    lowest_alt=min(results_table.Altitude_m); sub=results_table(results_table.Altitude_m==lowest_alt,:);
+    if height(sub)>3
+        u_aoa=unique(sub.AOA_deg); u_mach=unique(sub.Mach);
+        [X,Y]=meshgrid(u_aoa,u_mach); Z=griddata(sub.AOA_deg, sub.Mach, sub.LD_Ratio, X, Y);
+        if any(~isnan(Z(:)))
+            fig = figure('Name','3D Performance Map'); 
+            surf(X,Y,Z,'FaceColor','interp','EdgeAlpha',0.2);
+            colormap(jet(256));
+            xlabel('AoA'); ylabel('Mach'); zlabel('L/D'); title(sprintf('3D L/D Map (Alt %.0fm)', lowest_alt)); colorbar; view(30,25);
+        end
+    end
+end
+function visualize_optimal_pressure_plots(results_table, model, panels, q, S_ref)
+    u_alt=unique(results_table.Altitude_m);
+    for alt=u_alt'
+        sub=results_table(results_table.Altitude_m==alt & results_table.AOA_deg<10, :);
+        if isempty(sub), continue; end
+        [max_ld, idx]=max(sub.LD_Ratio); opt=sub(idx,:);
+        Cp=solver_hybrid_vlm(panels, opt.Mach, opt.AOA_deg, q, S_ref);
+        fig = figure('Name', sprintf('Opt Pressure %.0fm', alt));
+        patch('Faces',model.ConnectivityList,'Vertices',model.Points,'FaceVertexCData',Cp,'FaceColor','flat','EdgeColor','none');
+        colormap(jet(256));
+        axis equal; view(3); camlight; lighting gouraud; title(sprintf('Best L/D: %.2f (M=%.2f, AoA=%.1f)', max_ld, opt.Mach, opt.AOA_deg)); colorbar; caxis([-0.5 0.5]);
+    end
+end
+function visualize_supersonic_pressure_milestones(results_table, model, panels, q, S_ref)
+    targets=[2.0, 2.5, 3.0]; avail=unique(results_table.Mach(results_table.Mach>=1.2));
+    for t=targets
+        [~,idx]=min(abs(avail-t)); actual=avail(idx);
+        if abs(actual-t)>0.15, continue; end
+        sub=results_table(abs(results_table.Mach-actual)<1e-4,:);
+        [max_ld,idx]=max(sub.LD_Ratio); opt=sub(idx,:);
+        Cp=solver_hybrid_vlm(panels, opt.Mach, opt.AOA_deg, q, S_ref);
+        fig = figure('Name', sprintf('Supersonic M%.1f', actual));
+        patch('Faces',model.ConnectivityList,'Vertices',model.Points,'FaceVertexCData',Cp,'FaceColor','flat','EdgeColor','none');
+        colormap(jet(256));
+        axis equal; view(3); camlight; lighting gouraud; title(sprintf('Supersonic M%.1f Pressure', actual)); colorbar; caxis([-0.5 0.5]);
+    end
+end
